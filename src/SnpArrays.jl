@@ -39,9 +39,12 @@ function SnpArray(plinkFile::AbstractString)
   # http://pngu.mgh.harvard.edu/~purcell/plink/binary.shtml
   A1 = BitArray(nper, nsnp)
   A2 = BitArray(nper, nsnp)
-  if bits(bedheader[1]) == "01101100" && bits(bedheader[2]) == "00011011"
+#  if bits(bedheader[1]) == "01101100" && bits(bedheader[2]) == "00011011"
+    if bedheader[1] == 0x5c && bedheader[2] == 0x1b
+
     # v1.0 BED file
-    if bits(bedheader[3]) == "00000001"
+#    if bits(bedheader[3]) == "00000001"
+    if bedheader[3] == 0x01 
       # SNP-major
       plinkbits = Mmap.mmap(fid, BitArray, (2, 4ceil(Int, 0.25nper), nsnp), 3)
       A1 = copy!(A1, slice(plinkbits, 1, 1:nper, :))
@@ -218,6 +221,50 @@ function Base.copy!{T <: Real, N}(B::Array{T, N}, A::SnpLike{N};
   end
   return B
 end # function Base.copy!
+
+function Base.convert{T <: Real, N}(t::Type{Array{T, N}}, A::SnpLike{N}, minor_allele::BitArray{1};
+  model::Symbol = :additive, impute::Bool = false, center::Bool = false,
+  scale::Bool = false)
+  B = similar(A, T)
+  copy!(B, A, minor_allele; model = model, impute = impute, center = center, scale = scale)
+end # function Base.convert
+
+function Base.copy!{T <: Real, N}(B::Array{T, N}, A::SnpLike{N}, minor_allele::BitArray{1};
+  model::Symbol = :additive, impute::Bool = false, center::Bool = false,
+  scale::Bool = false)
+  @assert size(B) == size(A) "Dimensions do not match"
+  if ndims(A) == 1
+    m, n = length(A), 1
+  elseif ndims(A) == 2
+    m, n = size(A)
+  end
+  # convert column by column
+  @inbounds for j in 1:n
+    # first pass: find minor allele and its frequency
+    maf, = summarize(sub(A, :, j))
+    # second pass: impute, convert, center, scale
+    ct = convert(T, 2.0maf)
+    wt = convert(T, maf == 0.0 ? 1.0 : 1.0 / √(2.0maf * (1.0 - maf)))
+    @simd for i in 1:m
+      (a1, a2) = A[i, j]
+      # impute if asked
+      if isnan(a1, a2) && impute
+        a1, a2 = randgeno(maf, minor_allele[j])
+      end
+      B[i, j] = convert(T, (a1, a2), minor_allele[j], model)
+      if center
+        B[i, j] -= ct
+      end
+      if scale
+        B[i, j] *= wt
+      end
+    end
+  end
+  return B
+end # function Base.copy!
+
+
+
 
 """
 Convert a SNP matrix to a sparse matrix according to specified SNP model.
@@ -532,6 +579,48 @@ function pca_sp{T <: Real, TI}(A::SnpLike{2}, pcs::Int = 6,
   end
   return pcscore, pcloading, pcvariance
 end # function pca_sp
+
+#----------------------------------------------------------------------#
+### linear algebra
+
+import Base.LinAlg.A_mul_B!
+function A_mul_B!{T <: AbstractFloat}(
+    output :: DenseVector{T}, 
+    A      :: SnpArrays.SnpMatrix, 
+    b      :: DenseVector{T}, 
+    center :: DenseVector{T} = zeros(eltype(output), size(A,2)), 
+    weight :: DenseVector{T} = ones(eltype(output), size(A,2)), 
+    tmpvec :: DenseVector{T} = zeros(eltype(output), size(A, 1))
+)
+  wb = weight .* b
+  A_mul_B!(tmpvec, A.A1, wb)
+  A_mul_B!(output, A.A2, wb)
+  BLAS.axpy!(one(T), tmpvec, output)
+  shift = dot(center, wb)
+  @inbounds for i in eachindex(output)
+      output[i] -= shift
+  end
+  output
+end
+
+import Base.LinAlg.At_mul_B!
+function At_mul_B!{T <: AbstractFloat}(
+    output :: DenseVector{T}, 
+    A      :: SnpArrays.SnpMatrix, 
+    b      :: DenseVector{T}, 
+    center :: DenseVector{T} = zeros(eltype(output), size(A,2)), 
+    weight :: DenseVector{T} = ones(eltype(output), size(A,2)), 
+    tmpvec :: DenseVector{T} = zeros(eltype(output), size(A, 1))
+)
+  At_mul_B!(tmpvec, A.A1, b)
+  At_mul_B!(output, A.A2, b)
+  shift = sum(b)
+  @inbounds @simd for i in eachindex(tmpvec)
+    output[i] = (output[i] + tmpvec[i] - shift * center[i]) * weight[i]
+  end
+  output
+end
+
 
 """
 Gram matrix Acs'Acs multiply B, where Acs is the centered and scaled A.
